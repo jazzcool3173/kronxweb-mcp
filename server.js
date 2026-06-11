@@ -1,109 +1,114 @@
+import express from "express";
 import { McpServer } from "@modelcontextprotocol/sdk/server/mcp.js";
-import { SSEServerTransport } from "@modelcontextprotocol/sdk/server/sse.js";
-import { createMcpExpressApp } from "@modelcontextprotocol/sdk/server/express.js";
-import { fileURLToPath } from "node:url";
+import { StreamableHTTPServerTransport } from "@modelcontextprotocol/sdk/server/streamableHttp.js";
 import { z } from "zod";
+import { randomUUID } from "crypto";
+import fs from "fs";
+import path from "path";
 
-const app = createMcpExpressApp();
-const server = new McpServer({ name: "kronxweb", version: "1.0.0" });
-const transports = {};
+const PORT = process.env.PORT || 3000;
+const BASE_URL = process.env.BASE_URL || `http://localhost:${PORT}`;
+const PREVIEWS_DIR = "./previews";
 
-app.get("/", (req, res) => {
-  res.status(200).json({
-    name: "kronxweb",
-    status: "running",
-    endpoints: {
-      health: "/health",
-      mcp: "/mcp",
-      sse: "/sse",
-      messages: "/messages"
+if (!fs.existsSync(PREVIEWS_DIR)) {
+  fs.mkdirSync(PREVIEWS_DIR, { recursive: true });
+}
+
+const deployments = [];
+
+const server = new McpServer({ name: "kronxweb-mcp", version: "1.0.0" });
+
+server.tool(
+  "deploy_html",
+  {
+    description: "Deploy HTML and get a shareable URL for client review",
+    inputSchema: {
+      project_name: z.string().describe("Project name e.g. landing-page-v2"),
+      html_content: z.string().describe("Full HTML content to deploy"),
+    },
+  },
+  async ({ project_name, html_content }) => {
+    try {
+      const safeName = project_name.toLowerCase().replace(/[^a-z0-9-]/g, "-").replace(/-+/g, "-").slice(0, 60);
+      const id = randomUUID().slice(0, 8);
+      const fileName = `${safeName}-${id}.html`;
+      const filePath = path.join(PREVIEWS_DIR, fileName);
+      fs.writeFileSync(filePath, html_content, "utf8");
+      const publicUrl = `${BASE_URL}/previews/${fileName}`;
+      deployments.push({ id, name: project_name, fileName, url: publicUrl, createdAt: new Date().toISOString() });
+      return { content: [{ type: "text", text: `✅ Deployed!\n\nProject : ${project_name}\nURL     : ${publicUrl}\n\nShare this URL with your client.` }] };
+    } catch (err) {
+      return { content: [{ type: "text", text: `❌ Deploy failed: ${err.message}` }] };
     }
-  });
+  }
+);
+
+server.tool(
+  "list_deployments",
+  { description: "List all deployed HTML previews", inputSchema: {} },
+  async () => {
+    if (deployments.length === 0) return { content: [{ type: "text", text: "No deployments yet." }] };
+    const list = deployments.map((d, i) => `${i + 1}. ${d.name}\n   URL : ${d.url}\n   Date: ${d.createdAt}`).join("\n\n");
+    return { content: [{ type: "text", text: `📋 Deployments:\n\n${list}` }] };
+  }
+);
+
+server.tool(
+  "delete_deployment",
+  { description: "Delete a deployed preview", inputSchema: { project_name: z.string() } },
+  async ({ project_name }) => {
+    const index = deployments.findIndex((d) => d.name === project_name || d.id === project_name);
+    if (index === -1) return { content: [{ type: "text", text: `❌ Not found: ${project_name}` }] };
+    const dep = deployments[index];
+    const filePath = path.join(PREVIEWS_DIR, dep.fileName);
+    if (fs.existsSync(filePath)) fs.unlinkSync(filePath);
+    deployments.splice(index, 1);
+    return { content: [{ type: "text", text: `🗑️ Deleted: ${dep.name}` }] };
+  }
+);
+
+const app = express();
+app.use(express.json());
+
+app.use((req, res, next) => {
+  res.setHeader("Access-Control-Allow-Origin", "*");
+  res.setHeader("Access-Control-Allow-Methods", "GET, POST, OPTIONS");
+  res.setHeader("Access-Control-Allow-Headers", "*");
+  if (req.method === "OPTIONS") return res.sendStatus(200);
+  next();
 });
 
-// Tool 1: Deploy HTML
-server.tool("deploy_html",
-  { html_content: z.string(), project_name: z.string() },
-  async ({ html_content, project_name }) => {
-    // Save file + return public URL
-    // Your hosting logic here
-    const url = `https://kronxweb.com/previews/${project_name}`;
-    return { content: [{ type: "text", text: `Live at: ${url}` }] };
-  }
-);
+app.use("/previews", express.static(PREVIEWS_DIR));
 
-// Tool 2: List deployments
-server.tool("list_deployments",
-  {},
-  async () => {
-    return { content: [{ type: "text", text: "Your deployments here" }] };
+const sessions = {};
+
+app.all("/mcp", async (req, res) => {
+  const sessionId = req.headers["mcp-session-id"];
+
+  if (sessionId && sessions[sessionId]) {
+    await sessions[sessionId].handleRequest(req, res, req.body);
+    return;
   }
-);
+
+  if (req.method === "POST") {
+    const transport = new StreamableHTTPServerTransport({
+      sessionIdGenerator: () => randomUUID(),
+      onsessioninitialized: (id) => { sessions[id] = transport; },
+    });
+    transport.onclose = () => { if (transport.sessionId) delete sessions[transport.sessionId]; };
+    await server.connect(transport);
+    await transport.handleRequest(req, res, req.body);
+    return;
+  }
+
+  res.status(400).json({ error: "Bad request" });
+});
 
 app.get("/health", (req, res) => {
-  res.status(200).json({ ok: true, name: "kronxweb", version: "1.0.0" });
+  res.json({ status: "ok", server: "kronxweb-mcp", version: "1.0.0", deployments: deployments.length });
 });
 
-// SSE endpoint for Claude
-async function handleSseConnection(req, res) {
-  try {
-    const transport = new SSEServerTransport("/messages", res);
-    const { sessionId } = transport;
-
-    transports[sessionId] = transport;
-    transport.onclose = () => {
-      delete transports[sessionId];
-    };
-
-    await server.connect(transport);
-  } catch (error) {
-    console.error("Error establishing SSE stream:", error);
-    if (!res.headersSent) {
-      res.status(500).send("Error establishing SSE stream");
-    }
-  }
-}
-
-app.get("/mcp", handleSseConnection);
-app.get("/sse", handleSseConnection);
-
-app.post("/messages", async (req, res) => {
-  const { sessionId } = req.query;
-  if (!sessionId || typeof sessionId !== "string") {
-    res.status(400).send("Missing sessionId parameter");
-    return;
-  }
-
-  const transport = transports[sessionId];
-  if (!transport) {
-    res.status(404).send("Session not found");
-    return;
-  }
-
-  try {
-    await transport.handlePostMessage(req, res, req.body);
-  } catch (error) {
-    console.error("Error handling MCP message:", error);
-    if (!res.headersSent) {
-      res.status(500).send("Error handling MCP message");
-    }
-  }
+app.listen(PORT, () => {
+  console.log(`kronxweb MCP running → ${BASE_URL}/mcp`);
+  console.log(`Health check         → ${BASE_URL}/health`);
 });
-
-const isMain = process.argv[1] === fileURLToPath(import.meta.url);
-
-if (isMain) {
-  const port = process.env.PORT || 3000;
-  const host = process.env.HOST || "127.0.0.1";
-  app.listen(port, host, (error) => {
-    if (error) {
-      console.error("Failed to start Kronxweb MCP server:", error);
-      process.exitCode = 1;
-      return;
-    }
-
-    console.log(`Kronxweb MCP server listening at http://${host}:${port}`);
-  });
-}
-
-export default app;
