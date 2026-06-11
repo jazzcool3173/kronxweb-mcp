@@ -6,102 +6,216 @@ import { randomUUID } from "crypto";
 import { put, list, del } from "@vercel/blob";
 
 const PORT = process.env.PORT || 3000;
+const BLOB_TOKEN = process.env.KRONXWEB_READ_WRITE_TOKEN;
 
-// ─── Tool registration on a fresh McpServer instance ──────
+if (!BLOB_TOKEN) {
+  throw new Error(
+    "KRONXWEB_READ_WRITE_TOKEN environment variable is missing"
+  );
+}
+
+const app = express();
+app.use(express.json({ limit: "10mb" }));
+
+// Simple request logging
+app.use((req, res, next) => {
+  console.log(
+    `[${new Date().toISOString()}] ${req.method} ${req.originalUrl}`
+  );
+  next();
+});
+
+// CORS
+app.use((req, res, next) => {
+  res.setHeader("Access-Control-Allow-Origin", "*");
+  res.setHeader(
+    "Access-Control-Allow-Methods",
+    "GET, POST, DELETE, OPTIONS"
+  );
+  res.setHeader("Access-Control-Allow-Headers", "*");
+
+  if (req.method === "OPTIONS") {
+    return res.sendStatus(200);
+  }
+
+  next();
+});
+
+function getErrorMessage(error) {
+  return error instanceof Error ? error.message : String(error);
+}
+
+const sessions = new Map();
+
+// Clean old sessions every hour
+setInterval(() => {
+  const now = Date.now();
+
+  for (const [id, session] of sessions.entries()) {
+    const age = now - session.createdAt;
+
+    if (age > 24 * 60 * 60 * 1000) {
+      sessions.delete(id);
+      console.log(`Removed stale session: ${id}`);
+    }
+  }
+}, 60 * 60 * 1000);
+
 function createServer() {
-  const server = new McpServer({ name: "kronxweb-mcp", version: "1.0.0" });
+  const server = new McpServer({
+    name: "kronxweb-mcp",
+    version: "1.0.0",
+  });
 
-  // ─── Tool 1: deploy_html ──────────────────────────────────
+  // DEPLOY HTML
   server.tool(
     "deploy_html",
-    "Deploy an HTML file and get a public URL for client review",
+    "Deploy an HTML file and return a public URL",
     {
-      project_name: z.string().describe("Project name e.g. landing-page-v2"),
-      html_content: z.string().describe("Full HTML content to deploy"),
+      project_name: z.string(),
+      html_content: z.string(),
     },
     async ({ project_name, html_content }) => {
       try {
-        const safeName = project_name
-          .toLowerCase()
-          .replace(/[^a-z0-9-]/g, "-")
-          .replace(/-+/g, "-")
-          .slice(0, 60);
+        const safeName =
+          project_name
+            .toLowerCase()
+            .replace(/[^a-z0-9-]/g, "-")
+            .replace(/-+/g, "-")
+            .replace(/^-|-$/g, "")
+            .slice(0, 60) || "preview";
 
         const id = randomUUID().slice(0, 8);
+
         const fileName = `previews/${safeName}-${id}.html`;
 
         const blob = await put(fileName, html_content, {
           access: "public",
           contentType: "text/html",
           addRandomSuffix: false,
-          token: process.env.KRONXWEB_READ_WRITE_TOKEN,
+          token: BLOB_TOKEN,
         });
 
         return {
           content: [
             {
               type: "text",
-              text: `✅ Deployed!\n\nProject : ${project_name}\nURL     : ${blob.url}\n\nShare this URL with your client.`,
+              text:
+                `Deployment successful\n\n` +
+                `Project: ${project_name}\n` +
+                `URL: ${blob.url}`,
             },
           ],
         };
-      } catch (err) {
+      } catch (error) {
         return {
-          content: [{ type: "text", text: `❌ Deploy failed: ${err.message}` }],
+          content: [
+            {
+              type: "text",
+              text: `Deploy failed: ${getErrorMessage(error)}`,
+            },
+          ],
         };
       }
     }
   );
 
-  // ─── Tool 2: list_deployments ─────────────────────────────
+  // LIST DEPLOYMENTS
   server.tool(
     "list_deployments",
-    "List all deployed HTML previews",
+    "List all deployments",
     {},
     async () => {
       try {
         const { blobs } = await list({
           prefix: "previews/",
-          token: process.env.KRONXWEB_READ_WRITE_TOKEN,
+          token: BLOB_TOKEN,
         });
 
-        if (blobs.length === 0) {
+        if (!blobs.length) {
           return {
-            content: [{ type: "text", text: "No deployments yet. Use deploy_html first." }],
+            content: [
+              {
+                type: "text",
+                text: "No deployments found",
+              },
+            ],
           };
         }
 
-        const listText = blobs
-          .map((b, i) => `${i + 1}. ${b.pathname}\n   URL : ${b.url}\n   Date: ${b.uploadedAt}`)
+        blobs.sort(
+          (a, b) =>
+            new Date(b.uploadedAt).getTime() -
+            new Date(a.uploadedAt).getTime()
+        );
+
+        const output = blobs
+          .map(
+            (blob, index) =>
+              `${index + 1}. ${blob.pathname}\n` +
+              `URL: ${blob.url}\n` +
+              `Date: ${blob.uploadedAt}`
+          )
           .join("\n\n");
 
         return {
-          content: [{ type: "text", text: `📋 Deployments:\n\n${listText}` }],
+          content: [
+            {
+              type: "text",
+              text: output,
+            },
+          ],
         };
-      } catch (err) {
+      } catch (error) {
         return {
-          content: [{ type: "text", text: `❌ List failed: ${err.message}` }],
+          content: [
+            {
+              type: "text",
+              text: `List failed: ${getErrorMessage(error)}`,
+            },
+          ],
         };
       }
     }
   );
 
-  // ─── Tool 3: delete_deployment ────────────────────────────
+  // DELETE DEPLOYMENT
   server.tool(
     "delete_deployment",
-    "Delete a deployed HTML preview by its URL",
+    "Delete deployment by URL",
     {
-      url: z.string().describe("The full blob URL to delete"),
+      url: z.string().url(),
     },
     async ({ url }) => {
       try {
-        await del(url, { token: process.env.KRONXWEB_READ_WRITE_TOKEN });
+        const parsed = new URL(url);
+
+        if (!parsed.pathname.includes("/previews/")) {
+          throw new Error(
+            "Only preview files can be deleted"
+          );
+        }
+
+        await del(url, {
+          token: BLOB_TOKEN,
+        });
+
         return {
-          content: [{ type: "text", text: `🗑️ Deleted: ${url}` }],
+          content: [
+            {
+              type: "text",
+              text: `Deleted: ${url}`,
+            },
+          ],
         };
-      } catch (err) {
+      } catch (error) {
         return {
-          content: [{ type: "text", text: `❌ Delete failed: ${err.message}` }],
+          content: [
+            {
+              type: "text",
+              text: `Delete failed: ${getErrorMessage(error)}`,
+            },
+          ],
         };
       }
     }
@@ -110,63 +224,90 @@ function createServer() {
   return server;
 }
 
-// ─── Express App ──────────────────────────────────────────
-const app = express();
-app.use(express.json({ limit: "10mb" }));
-
-// CORS
-app.use((req, res, next) => {
-  res.setHeader("Access-Control-Allow-Origin", "*");
-  res.setHeader("Access-Control-Allow-Methods", "GET, POST, DELETE, OPTIONS");
-  res.setHeader("Access-Control-Allow-Headers", "*");
-  if (req.method === "OPTIONS") return res.sendStatus(200);
-  next();
-});
-
-const sessions = {};
-
-// ─── MCP Endpoint ─────────────────────────────────────────
 app.all("/mcp", async (req, res) => {
-  const sessionId = req.headers["mcp-session-id"];
+  try {
+    const sessionId = req.headers["mcp-session-id"];
 
-  if (sessionId && sessions[sessionId]) {
-    await sessions[sessionId].handleRequest(req, res, req.body);
-    return;
-  }
+    if (
+      sessionId &&
+      typeof sessionId === "string" &&
+      sessions.has(sessionId)
+    ) {
+      const session = sessions.get(sessionId);
 
-  if (req.method === "POST") {
-    const transport = new StreamableHTTPServerTransport({
-      sessionIdGenerator: () => randomUUID(),
-      onsessioninitialized: (id) => {
-        sessions[id] = transport;
-      },
+      await session.transport.handleRequest(
+        req,
+        res,
+        req.body
+      );
+
+      return;
+    }
+
+    if (req.method === "POST") {
+      const transport = new StreamableHTTPServerTransport({
+        sessionIdGenerator: () => randomUUID(),
+
+        onsessioninitialized: (id) => {
+          sessions.set(id, {
+            transport,
+            createdAt: Date.now(),
+          });
+
+          console.log(`Session created: ${id}`);
+        },
+      });
+
+      transport.onclose = () => {
+        if (transport.sessionId) {
+          sessions.delete(transport.sessionId);
+          console.log(
+            `Session closed: ${transport.sessionId}`
+          );
+        }
+      };
+
+      const server = createServer();
+
+      await server.connect(transport);
+      await transport.handleRequest(req, res, req.body);
+
+      return;
+    }
+
+    return res.status(400).json({
+      error: "Bad request",
     });
+  } catch (error) {
+    console.error(error);
 
-    transport.onclose = () => {
-      if (transport.sessionId) delete sessions[transport.sessionId];
-    };
-
-    // Fresh server instance per session — fixes "Already connected" crash
-    const server = createServer();
-    await server.connect(transport);
-    await transport.handleRequest(req, res, req.body);
-    return;
+    if (!res.headersSent) {
+      return res.status(500).json({
+        error: getErrorMessage(error),
+      });
+    }
   }
-
-  res.status(400).json({ error: "Bad request" });
 });
 
-// ─── Health Check ─────────────────────────────────────────
 app.get("/health", (req, res) => {
   res.json({
     status: "ok",
     server: "kronxweb-mcp",
     version: "1.0.0",
-    storage: "vercel-blob",
+    activeSessions: sessions.size,
   });
 });
 
-// ─── Start ────────────────────────────────────────────────
+process.on("SIGINT", () => {
+  console.log("Shutting down");
+  process.exit(0);
+});
+
+process.on("SIGTERM", () => {
+  console.log("Shutting down");
+  process.exit(0);
+});
+
 app.listen(PORT, () => {
-  console.log(`kronxweb MCP running on port ${PORT}`);
+  console.log(`kronxweb-mcp running on port ${PORT}`);
 });
